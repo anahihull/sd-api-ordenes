@@ -1,103 +1,149 @@
 // api-ordenes/index.js
 
-// ----------------------------------------
-// 1. DEPENDENCIAS
-// ----------------------------------------
-const express = require("express");
-const { v4: uuidv4 } = require("uuid");
+require('dotenv').config(); // Carga AWS_REGION y SQS_QUEUE_URL desde .env
 
-// ----------------------------------------
-// 2. DATOS EN MEMORIA (con órdenes precargadas)
-// ----------------------------------------
-/**
- * Órdenes precargadas:
- *  - id: "101", usuarioId: "1",   producto: "Teclado", cantidad: 2
- *  - id: "102", usuarioId: "2",   producto: "Mouse",   cantidad: 1
- */
-const ordenes = [
-  { id: "101", usuarioId: "1", producto: "Teclado", cantidad: 2 },
-  { id: "102", usuarioId: "2", producto: "Mouse",   cantidad: 1 },
-];
+const express = require('express');
+const {
+  SQSClient,
+  ReceiveMessageCommand,
+  DeleteMessageCommand
+} = require('@aws-sdk/client-sqs');
 
-// ----------------------------------------
-// 3. CREACIÓN DEL SERVIDOR
-// ----------------------------------------
 const app = express();
-app.use(express.json());
+app.use(express.json()); // Parsear JSON bodies
 
-const PORT = process.env.PORT || 4000;
+const { AWS_REGION, SQS_QUEUE_URL } = process.env;
+if (!AWS_REGION || !SQS_QUEUE_URL) {
+  console.error('❌ Debes definir AWS_REGION y SQS_QUEUE_URL en el .env');
+  process.exit(1);
+}
 
-// ----------------------------------------
-// 4. RUTAS CRUD PARA Órdenes
-// ----------------------------------------
+const sqsClient = new SQSClient({ region: AWS_REGION });
 
-// 4.1) GET /api/ordenes
-//      → Devuelve todas las órdenes (incluidas las precargadas)
-app.get("/api/ordenes", (req, res) => {
-  return res.json(ordenes);
-});
 
-// 4.2) GET /api/ordenes/:id
-//      → Devuelve una orden por su id
-app.get("/api/ordenes/:id", (req, res) => {
-  const { id } = req.params;
-  const orden = ordenes.find((o) => o.id === id);
-  if (!orden) {
-    return res.status(404).json({ mensaje: "Orden no encontrada." });
-  }
-  return res.json(orden);
-});
+let alumnos = [];
+let nextAlumnoId = 1;
 
-// 4.3) POST /api/ordenes
-//      → Crea una orden nueva (body = { usuarioId, producto, cantidad })
-app.post("/api/ordenes", (req, res) => {
-  const { usuarioId, producto, cantidad } = req.body;
-  if (!usuarioId || !producto || typeof cantidad !== "number") {
-    return res
-      .status(400)
-      .json({ mensaje: "Faltan campos 'usuarioId', 'producto' o 'cantidad' inválido." });
-  }
-  const nuevaOrden = { id: uuidv4(), usuarioId, producto, cantidad };
-  ordenes.push(nuevaOrden);
-  return res.status(201).json(nuevaOrden);
-});
 
-// 4.4) PUT /api/ordenes/:id
-//      → Actualiza una orden existente (body puede tener { producto?, cantidad? })
-app.put("/api/ordenes/:id", (req, res) => {
-  const { id } = req.params;
-  const { producto, cantidad } = req.body;
-  const orden = ordenes.find((o) => o.id === id);
-  if (!orden) {
-    return res.status(404).json({ mensaje: "Orden no encontrada para actualizar." });
-  }
-  if (producto !== undefined) orden.producto = producto;
-  if (cantidad !== undefined) orden.cantidad = cantidad;
-  return res.json(orden);
-});
+function crearAlumno({ nombre, fechaNacimiento, idCurso }) {
+  const nuevo = {
+    id: nextAlumnoId++,
+    nombre,
+    fechaNacimiento,
+    idCurso
+  };
+  alumnos.push(nuevo);
+  return nuevo;
+}
 
-// 4.5) DELETE /api/ordenes/:id
-//      → Elimina una orden por id
-app.delete("/api/ordenes/:id", (req, res) => {
-  const { id } = req.params;
-  const idx = ordenes.findIndex((o) => o.id === id);
-  if (idx === -1) {
-    return res.status(404).json({ mensaje: "Orden no encontrada para eliminar." });
-  }
-  ordenes.splice(idx, 1);
-  return res.status(204).send();
-});
-
-// ----------------------------------------
-// 5. RUTA RAÍZ
-// ----------------------------------------
 app.get("/", (_req, res) => {
-  res.send("API-Órdenes 🟢  (puerto 4000) - órdenes precargadas disponibles.");
+  res.send(`API-Funcionando 🟢 (puerto ${PORT})`);
 });
 
-// ----------------------------------------
-// 6. ARRANCAR EL SERVIDOR
-// ----------------------------------------
+async function pollSQS() {
+  const receiveParams = {
+    QueueUrl: SQS_QUEUE_URL,
+    MaxNumberOfMessages: 5,   // hasta 5 mensajes por lote
+    WaitTimeSeconds: 10,      // long polling de hasta 10 segundos
+    VisibilityTimeout: 30,    // oculta el mensaje 30s mientras se procesa
+  };
+
+  try {
+    const receiveCommand = new ReceiveMessageCommand(receiveParams);
+    const data = await sqsClient.send(receiveCommand);
+
+    if (data.Messages && data.Messages.length > 0) {
+      for (const msg of data.Messages) {
+        let bodyObj = null;
+        try {
+          bodyObj = JSON.parse(msg.Body);
+        } catch (errParse) {
+          console.error('Mensaje con JSON inválido, se ignorará:', msg.Body);
+        }
+
+        if (
+          bodyObj &&
+          bodyObj.action === 'create' &&
+          typeof bodyObj.payload === 'object' &&
+          bodyObj.payload !== null
+        ) {
+          const payload = bodyObj.payload;
+
+          if (
+            typeof payload.nombre === 'string' &&
+            typeof payload.fechaNacimiento === 'number' &&
+            typeof payload.idCurso === 'number'
+          ) {
+            // Usamos la función crearAlumno para agregar al arreglo 'alumnos'
+            const nuevoAlumno = crearAlumno({
+              nombre: payload.nombre,
+              fechaNacimiento: payload.fechaNacimiento,
+              idCurso: payload.idCurso
+            });
+            console.log('Se agregó alumno desde SQS:', nuevoAlumno);
+          } else {
+            console.warn('Payload incompleto o mal formado, se ignoró:', payload);
+          }
+        }
+
+        if (msg.ReceiptHandle) {
+          const deleteParams = {
+            QueueUrl: SQS_QUEUE_URL,
+            ReceiptHandle: msg.ReceiptHandle,
+          };
+          const deleteCommand = new DeleteMessageCommand(deleteParams);
+          await sqsClient.send(deleteCommand);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Error al procesar SQS:', err);
+  } finally {
+    // Espera 5 segundos antes de volver a hacer polling
+    setTimeout(pollSQS, 5000);
+  }
+}
+
+// Inicia el listener de SQS al arrancar la aplicación
+pollSQS().catch((err) => {
+  console.error('Error al iniciar pollSQS:', err);
+});
+
+
+
+app.get('/alumnos', (req, res) => {
+  res.json(alumnos);
+});
+
+
+app.get('/alumnos/:id', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const alumno = alumnos.find(a => a.id === id);
+  if (!alumno) {
+    return res.status(404).json({ error: `Alumno con id=${id} no encontrado.` });
+  }
+  return res.json(alumno);
+});
+
+
+app.delete('/alumnos/:id', (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  const index = alumnos.findIndex(a => a.id === id);
+  if (index === -1) {
+    return res.status(404).json({ error: `Alumno con id=${id} no encontrado.` });
+  }
+  const eliminado = alumnos.splice(index, 1)[0];
+  return res.json({ deleted: eliminado });
+});
+
+
+app.use((err, _req, res, _next) => {
+  console.error('Error inesperado en el servidor:', err);
+  res.status(500).json({ error: 'Internal Server Error' });
+});
+
+
+const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`API-Órdenes corriendo en http://localhost:${PORT}`);  
+  console.log(`✅ Segundo API “Alumnos” escuchando en http://localhost:${PORT}`);
 });
